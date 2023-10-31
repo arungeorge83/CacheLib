@@ -43,7 +43,10 @@ class MockDevice : public Device {
 
   MOCK_METHOD3(readImpl, bool(uint64_t, uint32_t, void*));
   MOCK_METHOD3(writeImpl, bool(uint64_t, uint32_t, const void*));
+  MOCK_METHOD4(writeImpl, bool(uint64_t, uint32_t, const void*,
+       std::shared_ptr<PlacementHandle>));
   MOCK_METHOD0(flushImpl, void());
+  MOCK_METHOD0(allocatePlacementHandle, std::shared_ptr<PlacementHandle>());
 
   // Returns pointer to the device backing this mock object. This is
   // useful if user wants to bypass the mock to access the real device
@@ -72,8 +75,11 @@ class SizeMockDevice : public Device {
   explicit SizeMockDevice(uint64_t deviceSize) : Device(deviceSize) {}
 
   bool writeImpl(uint64_t, uint32_t, const void*) override { return false; }
+  bool writeImpl(uint64_t, uint32_t, const void*,
+      std::shared_ptr<PlacementHandle>) override { return false; }
   bool readImpl(uint64_t, uint32_t, void*) override { return false; }
   void flushImpl() override {}
+  std::shared_ptr<PlacementHandle> allocatePlacementHandle() override { return nullptr; }
 };
 } // namespace navy
 } // namespace cachelib
