@@ -15,6 +15,7 @@
  */
 
 #include "cachelib/navy/common/Device.h"
+#include "cachelib/navy/common/FDPDevice.h"
 
 #include <folly/File.h>
 #include <folly/Format.h>
@@ -59,13 +60,15 @@ struct IOOp {
                 int fd,
                 uint64_t offset,
                 uint32_t size,
-                void* data)
+                void* data,
+                std::shared_ptr<PlacementHandle> handle)
       : parent_(parent),
         idx_(idx),
         fd_(fd),
         offset_(offset),
         size_(size),
-        data_(data) {}
+        data_(data),
+        handle_(handle) {}
 
   std::string toString() const;
 
@@ -80,6 +83,7 @@ struct IOOp {
   const uint64_t offset_ = 0;
   const uint32_t size_ = 0;
   void* const data_;
+  std::shared_ptr<PlacementHandle> handle_;
 
   // The number of resubmission on EAGAIN error
   uint8_t resubmitted_ = 0;
@@ -99,7 +103,8 @@ struct IOReq {
                  OpType opType,
                  uint64_t offset,
                  uint32_t size,
-                 void* data);
+                 void* data,
+                 std::shared_ptr<PlacementHandle> handle);
 
   const char* getOpName() const {
     switch (opType_) {
@@ -131,6 +136,7 @@ struct IOReq {
   const uint64_t offset_ = 0;
   const uint32_t size_ = 0;
   void* const data_;
+  std::shared_ptr<PlacementHandle> handle_;
 
   // Aggregate result of operations
   bool result_ = true;
@@ -162,14 +168,16 @@ class IoContext {
                                     uint32_t stripeSize,
                                     uint64_t offset,
                                     uint32_t size,
-                                    void* data);
+                                    void* data,
+                                    std::shared_ptr<PlacementHandle> handle);
 
   // Create and submit write req
   std::shared_ptr<IOReq> submitWrite(const std::vector<folly::File>& fvec,
                                      uint32_t stripeSize,
                                      uint64_t offset,
                                      uint32_t size,
-                                     const void* data);
+                                     const void* data,
+                                     std::shared_ptr<PlacementHandle> handle);
 
   // Submit a IOOp to the device; should not fail for AsyncIoContext
   virtual bool submitIo(IOOp& op) = 0;
@@ -264,6 +272,30 @@ class AsyncIoContext : public IoContext {
   size_t numCompleted_ = 0;
 };
 
+// A Generic data placement handle implementation
+class GenericPlacementHandle : public PlacementHandle {
+ public:
+  GenericPlacementHandle(uint16_t id = 0) : id_(id) {};
+  ~GenericPlacementHandle() override = default;
+
+  // Checks whether the id is valid.
+  bool valid() override { return id_ != kInvalid; }
+
+  // Returns the placement id for data placement.
+  uint16_t id() override { return id_; }
+
+  std::unique_ptr<folly::AsyncBaseOp> prepAsyncIo(
+      int, uint8_t, void*, uint32_t, uint64_t, void*, bool) override;
+
+  bool prepSyncIo(int, uint8_t, void*, uint32_t, uint64_t) override;
+
+  bool verifyResult(ssize_t, const uint32_t) override;
+
+ private:
+  static constexpr uint16_t kInvalid{~0u & 0xFFFF};
+  uint16_t id_{kInvalid};
+};
+
 // An FileDevice manages direct I/O to either a single or multiple (RAID0)
 // block device(s) or regular file(s).
 class FileDevice : public Device {
@@ -275,6 +307,7 @@ class FileDevice : public Device {
              uint32_t maxDeviceWriteSize,
              IoEngine ioEngine,
              uint32_t qDepthPerContext,
+             bool isFDPEnabled,
              std::shared_ptr<DeviceEncryptor> encryptor);
 
   FileDevice(const FileDevice&) = delete;
@@ -285,9 +318,13 @@ class FileDevice : public Device {
 
   bool writeImpl(uint64_t, uint32_t, const void*) override;
 
+  bool writeImpl(uint64_t, uint32_t, const void*, std::shared_ptr<PlacementHandle>) override;
+
   bool readImpl(uint64_t, uint32_t, void*) override;
 
   void flushImpl() override;
+
+  std::shared_ptr<PlacementHandle> allocatePlacementHandle() override;
 
   // File vector for devices or regular files
   const std::vector<folly::File> fvec_{};
@@ -311,6 +348,13 @@ class FileDevice : public Device {
   // The max number of outstanding requests per IO context. This is used to
   // determine the capacity of an io_uring/libaio queue
   const uint32_t qDepthPerContext_;
+
+  // Default Placement Handle
+  std::shared_ptr<PlacementHandle> defaultHandle_{nullptr};
+  // Whether FDP Placement mode is enabled or not
+  bool isFDPEnabled_{false};
+  // Device info for FDP support
+  std::unique_ptr<FdpDev> fdpDev_{nullptr};
 
   AtomicCounter numProcessed_{0};
 
@@ -338,11 +382,19 @@ class MemoryDevice final : public Device {
     std::memcpy(buffer_.get() + offset, value, size);
     return true;
   }
+  bool writeImpl(uint64_t offset, uint32_t size, const void* value,
+      std::shared_ptr<PlacementHandle> handle) override {
+    return writeImpl(offset, size, value);
+  }
 
   bool readImpl(uint64_t offset, uint32_t size, void* value) override {
     XDCHECK_LE(offset + size, getSize());
     std::memcpy(value, buffer_.get() + offset, size);
     return true;
+  }
+
+  std::shared_ptr<PlacementHandle> allocatePlacementHandle() override {
+    return std::make_shared<GenericPlacementHandle>();
   }
 
   void flushImpl() override {
@@ -354,19 +406,27 @@ class MemoryDevice final : public Device {
 } // namespace
 
 bool Device::write(uint64_t offset, BufferView view) {
+  return write(offset, view, nullptr);
+}
+
+bool Device::write(uint64_t offset, BufferView view, std::shared_ptr<PlacementHandle> handle) {
   if (encryptor_) {
     auto writeBuffer = makeIOBuffer(view.size());
     writeBuffer.copyFrom(0, view);
-    return write(offset, std::move(writeBuffer));
+    return write(offset, std::move(writeBuffer), handle);
   }
 
   const auto size = view.size();
   XDCHECK_LE(offset + size, size_);
   const uint8_t* data = reinterpret_cast<const uint8_t*>(view.data());
-  return writeInternal(offset, data, size);
+  return writeInternal(offset, data, size, handle);
 }
 
 bool Device::write(uint64_t offset, Buffer buffer) {
+  return write(offset, std::move(buffer), nullptr);
+}
+
+bool Device::write(uint64_t offset, Buffer buffer, std::shared_ptr<PlacementHandle> handle) {
   const auto size = buffer.size();
   XDCHECK_LE(offset + buffer.size(), size_);
   uint8_t* data = reinterpret_cast<uint8_t*>(buffer.data());
@@ -379,12 +439,14 @@ bool Device::write(uint64_t offset, Buffer buffer) {
       return false;
     }
   }
-  return writeInternal(offset, data, size);
+  return writeInternal(offset, data, size, handle);
 }
 
-bool Device::writeInternal(uint64_t offset, const uint8_t* data, size_t size) {
+bool Device::writeInternal(uint64_t offset, const uint8_t* data, size_t size,
+          std::shared_ptr<PlacementHandle> handle) {
   auto remainingSize = size;
   auto maxWriteSize = (maxWriteSize_ == 0) ? remainingSize : maxWriteSize_;
+  maxWriteSize = (maxIOSize_ == 0) ? maxWriteSize : maxIOSize_;
   bool result = true;
   while (remainingSize > 0) {
     auto writeSize = std::min<size_t>(maxWriteSize, remainingSize);
@@ -392,7 +454,7 @@ bool Device::writeInternal(uint64_t offset, const uint8_t* data, size_t size) {
     XDCHECK_EQ(writeSize % ioAlignmentSize_, 0ul);
 
     auto timeBegin = getSteadyClock();
-    result = writeImpl(offset, writeSize, data);
+    result = writeImpl(offset, writeSize, data, handle);
     writeLatencyEstimator_.trackValue(
         toMicros((getSteadyClock() - timeBegin)).count());
 
@@ -420,18 +482,30 @@ bool Device::writeInternal(uint64_t offset, const uint8_t* data, size_t size) {
 // returns true if successful, false otherwise.
 bool Device::readInternal(uint64_t offset, uint32_t size, void* value) {
   XDCHECK_EQ(reinterpret_cast<uint64_t>(value) % ioAlignmentSize_, 0ul);
-  XDCHECK_EQ(offset % ioAlignmentSize_, 0ul);
-  XDCHECK_EQ(size % ioAlignmentSize_, 0ul);
   XDCHECK_LE(offset + size, size_);
-  auto timeBegin = getSteadyClock();
-  bool result = readImpl(offset, size, value);
-  readLatencyEstimator_.trackValue(
-      toMicros(getSteadyClock() - timeBegin).count());
-  if (!result) {
-    readIOErrors_.inc();
-    return result;
+  uint8_t* data = reinterpret_cast<uint8_t*>(value);
+  auto remainingSize = size;
+  auto maxReadSize = (maxIOSize_ == 0) ? remainingSize : maxIOSize_;
+  bool result = true;
+  while (remainingSize > 0) {
+    auto readSize = std::min<size_t>(maxReadSize, remainingSize);
+    XDCHECK_EQ(offset % ioAlignmentSize_, 0ul);
+    XDCHECK_EQ(size % ioAlignmentSize_, 0ul);
+
+    auto timeBegin = getSteadyClock();
+    result = readImpl(offset, readSize, value);
+    readLatencyEstimator_.trackValue(
+        toMicros(getSteadyClock() - timeBegin).count());
+
+    if (result) {
+      bytesRead_.add(size);
+    } else {
+      break;
+    }
+    offset += readSize;
+    data += readSize;
+    remainingSize -= readSize;
   }
-  bytesRead_.add(size);
   if (encryptor_) {
     XCHECK_EQ(offset % encryptor_->encryptionBlockSize(), 0ul);
     auto res = encryptor_->decrypt(
@@ -442,7 +516,10 @@ bool Device::readInternal(uint64_t offset, uint32_t size, void* value) {
       return false;
     }
   }
-  return true;
+  if (!result) {
+    readIOErrors_.inc();
+  }
+  return result;
 }
 
 // This API reads size bytes from the Device from offset into a Buffer and
@@ -497,6 +574,41 @@ void Device::getCounters(const CounterVisitor& visitor) const {
 
 namespace {
 /*
+ * GenericPlacementHandler
+ */
+std::unique_ptr<folly::AsyncBaseOp>
+GenericPlacementHandle::prepAsyncIo(int fd, uint8_t opType, void* data,
+    uint32_t size, uint64_t offset, void* userdata, bool useIoUring) {
+  std::unique_ptr<folly::AsyncBaseOp> asyncOp;
+
+  if (useIoUring) {
+#ifndef CACHELIB_IOURING_DISABLE
+    asyncOp = std::make_unique<folly::IoUringOp>();
+#endif
+  } else {
+    asyncOp = std::make_unique<folly::AsyncIOOp>();
+  }
+
+  asyncOp->setUserData(userdata);
+  if (opType == OpType::READ) {
+    asyncOp->pread(fd, data, size, offset);
+  } else {
+    XDCHECK_EQ(opType, OpType::WRITE);
+    asyncOp->pwrite(fd, data, size, offset);
+  }
+
+  return std::move(asyncOp);
+}
+
+bool GenericPlacementHandle::prepSyncIo(int fd, uint8_t opType, void* data,
+    uint32_t size, uint64_t offset) {
+  throw std::runtime_error("Not Implemented.");
+}
+
+bool GenericPlacementHandle::verifyResult(ssize_t status, const uint32_t size) {
+  return (status == size);
+}
+/*
  * IOOp
  */
 std::string IOOp::toString() const {
@@ -508,8 +620,7 @@ std::string IOOp::toString() const {
 
 bool IOOp::done(ssize_t status) {
   XDCHECK(parent_.opType_ == READ || parent_.opType_ == WRITE);
-
-  bool result = (status == size_);
+  bool result = handle_->verifyResult(status, size_);
   if (!result) {
     // Report IO errors
     XLOG_N_PER_MS(ERR, 10, 1000) << folly::sformat(
@@ -542,12 +653,14 @@ IOReq::IOReq(IoContext& context,
              OpType opType,
              uint64_t offset,
              uint32_t size,
-             void* data)
+             void* data,
+             std::shared_ptr<PlacementHandle> handle)
     : context_(context),
       opType_(opType),
       offset_(offset),
       size_(size),
-      data_(data) {
+      data_(data),
+      handle_(handle) {
   uint8_t* buf = reinterpret_cast<uint8_t*>(data_);
   uint32_t idx = 0;
   if (fvec.size() > 1) {
@@ -561,14 +674,15 @@ IOReq::IOReq(IoContext& context,
 
       ops_.emplace_back(*this, idx++, fvec[fdIdx].fd(),
                         stripeStartOffset + ioOffsetInStripe, allowedIOSize,
-                        buf);
+                        buf, handle_);
 
       size -= allowedIOSize;
       offset += allowedIOSize;
       buf += allowedIOSize;
     }
   } else {
-    ops_.emplace_back(*this, idx++, fvec[0].fd(), offset_, size_, data_);
+    ops_.emplace_back(*this, idx++, fvec[0].fd(), offset_, size_, data_,
+        handle_);
   }
 
   numRemaining_ = ops_.size();
@@ -632,9 +746,10 @@ std::shared_ptr<IOReq> IoContext::submitRead(
     uint32_t stripeSize,
     uint64_t offset,
     uint32_t size,
-    void* data) {
+    void* data,
+    std::shared_ptr<PlacementHandle> handle) {
   auto req = std::make_shared<IOReq>(*this, fvec, stripeSize, OpType::READ,
-                                     offset, size, data);
+                                     offset, size, data, handle);
   submitReq(req);
   return req;
 }
@@ -644,9 +759,11 @@ std::shared_ptr<IOReq> IoContext::submitWrite(
     uint32_t stripeSize,
     uint64_t offset,
     uint32_t size,
-    const void* data) {
+    const void* data,
+    std::shared_ptr<PlacementHandle> handle) {
   auto req = std::make_shared<IOReq>(*this, fvec, stripeSize, OpType::WRITE,
-                                     offset, size, const_cast<void*>(data));
+                                     offset, size, const_cast<void*>(data),
+                                     handle);
   submitReq(req);
   return req;
 }
@@ -712,6 +829,7 @@ AsyncIoContext::AsyncIoContext(std::unique_ptr<folly::AsyncBase>&& asyncBase,
   XDCHECK(!useIoUring_);
   useIoUring_ = false;
 #endif
+
   if (evb) {
     compHandler_ =
         std::make_unique<CompletionHandler>(*this, evb, asyncBase_->pollFd());
@@ -788,24 +906,10 @@ bool AsyncIoContext::submitIo(IOOp& op) {
   }
 
   std::unique_ptr<folly::AsyncBaseOp> asyncOp;
-  if (useIoUring_) {
-#ifndef CACHELIB_IOURING_DISABLE
-    asyncOp = std::make_unique<folly::IoUringOp>();
-#endif
-  } else {
-    asyncOp = std::make_unique<folly::AsyncIOOp>();
-  }
-
-  if (req.opType_ == OpType::READ) {
-    asyncOp->setUserData(&op);
-    asyncOp->pread(op.fd_, op.data_, op.size_, op.offset_);
-  } else {
-    XDCHECK_EQ(req.opType_, OpType::WRITE);
-    asyncOp->setUserData(&op);
-    asyncOp->pwrite(op.fd_, op.data_, op.size_, op.offset_);
-  }
-
+  asyncOp = op.handle_->prepAsyncIo(op.fd_, req.opType_, op.data_,
+      op.size_, op.offset_, &op, useIoUring_);
   asyncBase_->submit(asyncOp.release());
+
   op.submitTime_ = getSteadyClock();
 
   numOutstanding_++;
@@ -831,6 +935,7 @@ FileDevice::FileDevice(std::vector<folly::File>&& fvec,
                        uint32_t maxDeviceWriteSize,
                        IoEngine ioEngine,
                        uint32_t qDepthPerContext,
+                       bool isFDPEnabled,
                        std::shared_ptr<DeviceEncryptor> encryptor)
     : Device(fileSize * fvec.size(),
              std::move(encryptor),
@@ -839,7 +944,8 @@ FileDevice::FileDevice(std::vector<folly::File>&& fvec,
       fvec_(std::move(fvec)),
       stripeSize_(stripeSize),
       ioEngine_(ioEngine),
-      qDepthPerContext_(qDepthPerContext) {
+      qDepthPerContext_(qDepthPerContext),
+      isFDPEnabled_(isFDPEnabled) {
   XDCHECK_GT(blockSize, 0u);
   if (fvec_.size() > 1) {
     XDCHECK_GT(stripeSize_, 0u);
@@ -862,6 +968,19 @@ FileDevice::FileDevice(std::vector<folly::File>&& fvec,
   } else {
     XDCHECK_GT(qDepthPerContext_, 0u);
   }
+#ifndef CACHELIB_IOURING_DISABLE
+  if (isFDPEnabled_) {
+    fdpDev_ = std::make_unique<FdpDev>(fvec_[0].fd());
+    setMaxIOSize(fdpDev_->getMaxTfrSize());
+  }
+#else
+  isFDPEnabled_ = false;
+#endif
+  if (isFDPEnabled_) {
+    defaultHandle_ = fdpDev_->allocateFdpHandle();
+  } else {
+    defaultHandle_ = std::make_shared<GenericPlacementHandle>();
+  }
 
   XLOGF(INFO,
         "Created device with num_devices {} size {} block_size {},"
@@ -872,13 +991,19 @@ FileDevice::FileDevice(std::vector<folly::File>&& fvec,
 
 bool FileDevice::readImpl(uint64_t offset, uint32_t size, void* value) {
   auto req =
-      getIoContext()->submitRead(fvec_, stripeSize_, offset, size, value);
+      getIoContext()->submitRead(fvec_, stripeSize_, offset, size, value, defaultHandle_);
   return req->waitCompletion();
 }
 
 bool FileDevice::writeImpl(uint64_t offset, uint32_t size, const void* value) {
+  return writeImpl(offset, size, value, defaultHandle_);
+}
+
+bool FileDevice::writeImpl(uint64_t offset, uint32_t size, const void* value,
+      std::shared_ptr<PlacementHandle> handle) {
+  auto hdl = (handle == nullptr) ? defaultHandle_ : handle;
   auto req =
-      getIoContext()->submitWrite(fvec_, stripeSize_, offset, size, value);
+      getIoContext()->submitWrite(fvec_, stripeSize_, offset, size, value, hdl);
   return req->waitCompletion();
 }
 
@@ -895,6 +1020,7 @@ IoContext* FileDevice::getIoContext() {
 
   if (!tlContext_) {
     bool useIoUring = ioEngine_ == IoEngine::IoUring;
+    bool useFdpIoUringCmd = isFDPEnabled_;
     // Create new context if on event base thread or useIoUring_ is enabled
     auto evb = folly::EventBaseManager::get()->getExistingEventBase();
 
@@ -908,8 +1034,16 @@ IoContext* FileDevice::getIoContext() {
 
     if (useIoUring) {
 #ifndef CACHELIB_IOURING_DISABLE
-      asyncBase = std::make_unique<folly::IoUring>(qDepthPerContext_, pollMode,
+      if (useFdpIoUringCmd) {
+        folly::IoUringOp::Options options;
+        options.sqe128 = true;
+        options.cqe32 = true;
+        asyncBase = std::make_unique<folly::IoUring>(qDepthPerContext_, pollMode,
+                                                   qDepthPerContext_, options);
+      } else {
+        asyncBase = std::make_unique<folly::IoUring>(qDepthPerContext_, pollMode,
                                                    qDepthPerContext_);
+      }
 #endif
     } else {
       XDCHECK_EQ(ioEngine_, IoEngine::LibAio);
@@ -933,6 +1067,13 @@ IoContext* FileDevice::getIoContext() {
   return tlContext_.get();
 }
 
+std::shared_ptr<PlacementHandle> FileDevice::allocatePlacementHandle() {
+  if (isFDPEnabled_) {
+    return fdpDev_->allocateFdpHandle();
+  }
+  return std::make_shared<GenericPlacementHandle>();
+}
+
 } // namespace
 
 std::unique_ptr<Device> createMemoryDevice(
@@ -951,6 +1092,7 @@ std::unique_ptr<Device> createDirectIoFileDevice(
     uint32_t maxDeviceWriteSize,
     IoEngine ioEngine,
     uint32_t qDepthPerContext,
+    bool isFDPEnabled,
     std::shared_ptr<DeviceEncryptor> encryptor) {
   XDCHECK(folly::isPowTwo(blockSize));
 
@@ -961,6 +1103,7 @@ std::unique_ptr<Device> createDirectIoFileDevice(
                                       maxDeviceWriteSize,
                                       ioEngine,
                                       qDepthPerContext,
+                                      isFDPEnabled,
                                       encryptor);
 }
 
@@ -978,6 +1121,7 @@ std::unique_ptr<Device> createDirectIoFileDevice(
                                   maxDeviceWriteSize,
                                   IoEngine::Sync,
                                   0,
+                                  false,
                                   encryptor);
 }
 

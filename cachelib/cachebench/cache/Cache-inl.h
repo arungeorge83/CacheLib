@@ -175,6 +175,7 @@ Cache<Allocator>::Cache(const CacheConfig& config,
           config_.navyReqOrderShardsPower);
     }
     nvmConfig.navyConfig.setBlockSize(config_.navyBlockSize);
+    nvmConfig.navyConfig.setFDPMode(config_.fdpMode);
 
     // configure BlockCache
     auto& bcConfig = nvmConfig.navyConfig.blockCache()

@@ -60,6 +60,7 @@ RegionManager::RegionManager(uint32_t numRegions,
   }
 
   resetEvictionPolicy();
+  placementHandle_ = device.allocatePlacementHandle();
 }
 
 RegionId RegionManager::evict() {
@@ -492,7 +493,7 @@ bool RegionManager::deviceWrite(RelAddress addr, Buffer buf) {
   const auto bufSize = buf.size();
   XDCHECK(isValidIORange(addr.offset(), bufSize));
   auto physOffset = physicalOffset(addr);
-  if (!device_.write(physOffset, std::move(buf))) {
+  if (!device_.write(physOffset, std::move(buf), placementHandle())) {
     return false;
   }
   physicalWrittenCount_.add(bufSize);
@@ -503,7 +504,7 @@ bool RegionManager::deviceWrite(RelAddress addr, BufferView view) {
   const auto bufSize = view.size();
   XDCHECK(isValidIORange(addr.offset(), bufSize));
   auto physOffset = physicalOffset(addr);
-  if (!device_.write(physOffset, view)) {
+  if (!device_.write(physOffset, view, placementHandle())) {
     return false;
   }
   physicalWrittenCount_.add(bufSize);

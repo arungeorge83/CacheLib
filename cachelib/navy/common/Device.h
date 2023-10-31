@@ -18,6 +18,7 @@
 
 #include <folly/File.h>
 #include <folly/io/IOBuf.h>
+#include <folly/experimental/io/AsyncIO.h>
 
 #include "cachelib/allocator/nvmcache/NavyConfig.h"
 #include "cachelib/common/AtomicCounter.h"
@@ -51,6 +52,26 @@ class DeviceEncryptor {
   // @param salt    this must be the same earlier used for encryption
   // @return        true if success, false otherwise
   virtual bool decrypt(folly::MutableByteRange value, uint64_t salt) = 0;
+};
+
+// Abstract Data Placement Handle
+class PlacementHandle {
+ public:
+  virtual ~PlacementHandle() = default;
+
+  // Checks whether the data placement handle is valid.
+  virtual bool valid() = 0;
+
+  // Returns an Id associated with the handle.
+  virtual uint16_t id() = 0;
+
+  // prepares an async io
+  virtual std::unique_ptr<folly::AsyncBaseOp> prepAsyncIo(
+      int fd, uint8_t opType, void* data, uint32_t size, uint64_t offset,
+      void* user_data, bool iouring) = 0;
+  virtual bool prepSyncIo(int fd, uint8_t opType, void* data, uint32_t size, uint64_t offset) = 0;
+  // verify the completion status
+  virtual bool verifyResult(ssize_t status, const uint32_t size) = 0;
 };
 
 // Device abstraction
@@ -118,9 +139,20 @@ class Device {
   // @param offset    Must be ioAlignmentSize_ aligned
   bool write(uint64_t offset, Buffer buffer);
 
+  // @handle Placement Handle for data placement technolgies like FDP
+  bool write(uint64_t offset, Buffer buffer,
+      std::shared_ptr<PlacementHandle> handle);
+
   // Write buffer view to the device. This call makes a copy of the buffer if
   // entryptor is present.
   bool write(uint64_t offset, BufferView bufferView);
+
+  // The version with PlacementHandle support
+  bool write(uint64_t offset, BufferView bufferView,
+      std::shared_ptr<PlacementHandle> handle);
+
+  // Allocate a new stream and return the handle for Placement capable devices.
+  virtual std::shared_ptr<PlacementHandle> allocatePlacementHandle() = 0;
 
   // Reads @size bytes from device at @deviceOffset and copys to @value
   // There must be sufficient space allocated already in the mutableView.
@@ -154,8 +186,12 @@ class Device {
   // Returns the alignment size for device io operations
   uint32_t getIOAlignmentSize() const { return ioAlignmentSize_; }
 
+  void setMaxIOSize(uint32_t maxIOSize) { maxIOSize_ = maxIOSize; }
+
  protected:
   virtual bool writeImpl(uint64_t offset, uint32_t size, const void* value) = 0;
+  virtual bool writeImpl(uint64_t offset, uint32_t size, const void* value,
+                  std::shared_ptr<PlacementHandle> handle) = 0;
   virtual bool readImpl(uint64_t offset, uint32_t size, void* value) = 0;
   virtual void flushImpl() = 0;
 
@@ -172,7 +208,8 @@ class Device {
 
   bool readInternal(uint64_t offset, uint32_t size, void* value);
 
-  bool writeInternal(uint64_t offset, const uint8_t* data, size_t size);
+  bool writeInternal(uint64_t offset, const uint8_t* data, size_t size,
+                  std::shared_ptr<PlacementHandle> handle);
 
   // size of the device. All offsets for write/read should be contained
   // below this.
@@ -187,6 +224,10 @@ class Device {
   // writes so that the device read latency is not adversely impacted by
   // large device writes
   const uint32_t maxWriteSize_{0};
+
+  // Some devices have this transfer size limit due to DMA size limitations.
+  // This limit is applicable for both writes and reads.
+  uint32_t maxIOSize_{0};
 
   std::shared_ptr<DeviceEncryptor> encryptor_;
 
@@ -214,6 +255,7 @@ std::unique_ptr<Device> createMemoryDevice(
 // @param ioEngine              IO engine to be used
 // @param qDepth                queue depth per each IO thread.
 //                              If 0, sync IO will be used
+// @param isFDPEnabled          Whether FDP placement mode is enabled or not.
 // @param encryptor             encryption object
 std::unique_ptr<Device> createDirectIoFileDevice(
     std::vector<folly::File> fVec,
@@ -223,6 +265,7 @@ std::unique_ptr<Device> createDirectIoFileDevice(
     uint32_t maxDeviceWriteSize,
     IoEngine ioEngine,
     uint32_t qDepth,
+    bool isFDPEnabled,
     std::shared_ptr<DeviceEncryptor> encryptor);
 
 // A convenient wrapper for creating Device with a sync IO

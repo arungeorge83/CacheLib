@@ -89,6 +89,9 @@ class BigHash final : public Engine {
   // Return the size of usable space
   uint64_t getSize() const override { return bucketSize_ * numBuckets_; }
 
+  std::shared_ptr<PlacementHandle> placementHandle() {
+    return placementHandle_;
+  }
   // Check if the key could exist in bighash. This can be used as a pre-check
   // to optimize cache lookups to avoid calling lookups in an async IO
   // environment.
@@ -223,6 +226,8 @@ class BigHash final : public Engine {
   std::unique_ptr<BloomFilter> bloomFilter_;
   std::chrono::nanoseconds generationTime_{};
   Device& device_;
+  // handle for data placement technologies like FDP
+  std::shared_ptr<PlacementHandle> placementHandle_;
   std::unique_ptr<folly::SharedMutex[]> mutex_{
       new folly::SharedMutex[kNumMutexes]};
   // Last access time for each bucket.

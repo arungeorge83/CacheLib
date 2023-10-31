@@ -110,6 +110,10 @@ class RegionManager {
   const RegionId getRandomRegion() const {
     return RegionId{folly::Random::rand32(0, numRegions_)};
   }
+
+  std::shared_ptr<PlacementHandle> placementHandle() {
+    return placementHandle_;
+  }
   // Flushes the in memory buffer attached to a region in either async or
   // sync mode.
   // In async mode, a flush job will be added to a job scheduler;
@@ -315,6 +319,7 @@ class RegionManager {
   // Locking order is region lock, followed by bufferMutex_;
   mutable std::mutex bufferMutex_;
   std::vector<std::unique_ptr<Buffer>> buffers_;
+  std::shared_ptr<PlacementHandle> placementHandle_;
 };
 } // namespace navy
 } // namespace cachelib
