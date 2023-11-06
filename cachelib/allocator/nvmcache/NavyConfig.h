@@ -487,6 +487,8 @@ class NavyConfig {
   bool isBigHashEnabled() const {
     return enginesConfigs_[0].bigHash().getSizePct() > 0;
   }
+  bool isFDPEnabled() const { return fdp_; }
+
   std::map<std::string, std::string> serialize() const;
 
   // Getters:
@@ -548,6 +550,8 @@ class NavyConfig {
   // ============ Device settings =============
   // Set the device block size, i.e., minimum unit of IO
   void setBlockSize(uint64_t blockSize) noexcept { blockSize_ = blockSize; }
+  // Set the FDP data placment mode in device
+  void setFDPMode(bool enable) noexcept { fdp_ = enable; }
   // Set the parameters for a simple file.
   // @throw std::invalid_argument if RAID files have been already set.
   void setSimpleFile(const std::string& fileName,
@@ -677,6 +681,8 @@ class NavyConfig {
   // Whether to use write size (instead of parcel size) for Navy admission
   // policy.
   bool useEstimatedWriteSize_{false};
+  // Whether Navy will use the FDP data placement directives or not.
+  bool fdp_{false};
 };
 } // namespace navy
 } // namespace cachelib

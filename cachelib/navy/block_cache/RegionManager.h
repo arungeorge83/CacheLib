@@ -315,6 +315,7 @@ class RegionManager {
   // Locking order is region lock, followed by bufferMutex_;
   mutable std::mutex bufferMutex_;
   std::vector<std::unique_ptr<Buffer>> buffers_;
+  int placementHandle_;
 };
 } // namespace navy
 } // namespace cachelib

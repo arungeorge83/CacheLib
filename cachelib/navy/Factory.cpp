@@ -423,6 +423,26 @@ folly::File openCacheFile(const std::string& fileName,
 
   return f;
 }
+// Open Nvme Character device @fileName.
+// Throws std::system_error if failed.
+folly::File openNvmeCharFile(const std::string& fileName) {
+  XLOG(INFO) << "Opening NVMe Char file: " << fileName;
+  if (fileName.empty()) {
+    throw std::invalid_argument("File name is empty");
+  }
+
+  int flags{O_RDONLY};
+  folly::File f;
+
+  try {
+    f = folly::File(fileName.c_str(), flags);
+  } catch (const std::system_error& e) {
+    throw;
+  }
+  XDCHECK_GE(f.fd(), 0);
+
+  return f;
+}
 } // namespace
 
 std::unique_ptr<BlockCacheProto> createBlockCacheProto() {
@@ -454,6 +474,7 @@ std::unique_ptr<Device> createFileDevice(
     uint32_t maxDeviceWriteSize,
     IoEngine ioEngine,
     uint32_t qDepth,
+    bool isFDPEnabled,
     std::shared_ptr<navy::DeviceEncryptor> encryptor) {
   // File paths are opened in the increasing order of the
   // path string. This ensures that RAID0 stripes aren't
@@ -466,7 +487,11 @@ std::unique_ptr<Device> createFileDevice(
   for (const auto& path : filePaths) {
     folly::File f;
     try {
-      f = openCacheFile(path, fdSize, truncateFile);
+      if(isFDPEnabled) {
+        f = openNvmeCharFile(path);
+      } else {
+        f = openCacheFile(path, fdSize, truncateFile);
+      }
     } catch (const std::exception& e) {
       XLOG(ERR) << "Exception in openCacheFile: " << path << e.what()
                 << ". Errno: " << errno;
@@ -482,6 +507,7 @@ std::unique_ptr<Device> createFileDevice(
                                   maxDeviceWriteSize,
                                   ioEngine,
                                   qDepth,
+                                  isFDPEnabled,
                                   std::move(encryptor));
 }
 

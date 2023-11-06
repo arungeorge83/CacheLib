@@ -103,6 +103,7 @@ BigHash::BigHash(Config&& config, ValidConfigTag)
         bucketSize_,
         cacheBaseOffset_);
   reset();
+  placementHandle_ = device_.allocatePlacementHandle();
 }
 
 void BigHash::reset() {
@@ -571,7 +572,7 @@ Buffer BigHash::readBucket(BucketId bid) {
 bool BigHash::writeBucket(BucketId bid, Buffer buffer) {
   auto* bucket = reinterpret_cast<Bucket*>(buffer.data());
   bucket->setChecksum(Bucket::computeChecksum(buffer.view()));
-  return device_.write(getBucketOffset(bid), std::move(buffer));
+  return device_.write(getBucketOffset(bid), std::move(buffer), placementHandle_);
 }
 } // namespace navy
 } // namespace cachelib

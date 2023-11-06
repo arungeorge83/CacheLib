@@ -223,6 +223,8 @@ class BigHash final : public Engine {
   std::unique_ptr<BloomFilter> bloomFilter_;
   std::chrono::nanoseconds generationTime_{};
   Device& device_;
+  // handle for data placement technologies like FDP
+  int placementHandle_;
   std::unique_ptr<folly::SharedMutex[]> mutex_{
       new folly::SharedMutex[kNumMutexes]};
   // Last access time for each bucket.
