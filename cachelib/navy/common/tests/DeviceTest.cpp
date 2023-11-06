@@ -222,6 +222,7 @@ struct DeviceParamTest
                                        maxDeviceWriteSize,
                                        ioEngine_,
                                        qDepth_,
+                                       false,
                                        std::move(encryptor));
     return device_;
   }
