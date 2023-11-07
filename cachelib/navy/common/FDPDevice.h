@@ -17,6 +17,7 @@
 #pragma once
 
 #include "cachelib/navy/common/Device.h"
+#include "cachelib/navy/common/Buffer.h"
 #include <folly/File.h>
 #include <folly/experimental/io/AsyncBase.h>
 #include <folly/experimental/io/IoUring.h>
@@ -108,6 +109,7 @@ struct nvme_id_ns {
 #define NVME_IDENTIFY_CSI_SHIFT 24
 enum nvme_identify_cns {
   NVME_IDENTIFY_CNS_NS        = 0x00,
+  NVME_IDENTIFY_CNS_CTRL      = 0x01,
   NVME_IDENTIFY_CNS_CSI_NS    = 0x05,
   NVME_IDENTIFY_CNS_CSI_CTRL  = 0x06,
 };
@@ -119,14 +121,42 @@ enum nvme_csi {
 };
 
 enum nvme_admin_opcode {
-  nvme_admin_get_log_page         = 0x02,
-  nvme_admin_identify             = 0x06,
-  nvme_admin_get_features         = 0x0a,
+  nvme_admin_get_log_page     = 0x02,
+  nvme_admin_identify         = 0x06,
+  nvme_admin_get_features     = 0x0a,
+};
+
+enum nvme_features_id {
+  NVME_FEAT_FID_FDP           = 0x1d,
+};
+
+enum nvme_cmd_get_log_lid {
+  NVME_LOG_LID_FDP_CONFIGS    = 0x20,
+};
+
+enum nvme_io_mgmt_recv_mo {
+  NVME_IO_MGMT_RECV_RUH_STATUS = 0x1,
+};
+
+struct nvme_fdp_ruh_status_desc {
+  uint16_t pid;
+  uint16_t ruhid;
+  uint32_t earutr;
+  uint64_t ruamw;
+  uint8_t  rsvd16[16];
+};
+
+struct nvme_fdp_ruh_status {
+  uint8_t  rsvd0[14];
+  uint16_t nruhsd;
+  struct nvme_fdp_ruh_status_desc ruhss[];
 };
 
 enum nvme_io_opcode {
   nvme_cmd_write    = 0x01,
   nvme_cmd_read     = 0x02,
+  nvme_cmd_io_mgmt_recv   = 0x12,
+  nvme_cmd_io_mgmt_send   = 0x1d,
 };
 
 static inline int ilog2(uint32_t i) {
@@ -148,8 +178,9 @@ class NvmeData {
   NvmeData() = default;
   NvmeData& operator=(const NvmeData&) = default;
 
-  explicit NvmeData(int nsId, uint32_t lbaShift, uint64_t nLba)
-    : nsId_(nsId), lbaShift_(lbaShift), nLba_(nLba) {}
+  explicit NvmeData(int nsId, uint32_t lbaShift, uint64_t nLba,
+      uint32_t maxTfrSize)
+    : nsId_(nsId), lbaShift_(lbaShift), nLba_(nLba), maxTfrSize_(maxTfrSize) {}
 
   // NVMe Namespace ID
   int nsId() const { return nsId_;}
@@ -160,10 +191,14 @@ class NvmeData {
   // Num of LBAs in device
   uint64_t nLba() const { return nLba_;}
 
+  // Get the max transfer size of NVMe device.
+  uint32_t getMaxTfrSize() { return maxTfrSize_; }
+
  private:
   int nsId_;
   uint32_t lbaShift_;
   uint64_t nLba_;
+  uint32_t maxTfrSize_{};
 };
 
 // FDP specific info and handling
@@ -183,10 +218,13 @@ class FdpInfo {
   int allocateFdpHandle();
 
   // Get the max transfer size of NVMe device.
-  uint32_t getMaxTfrSize() { return maxTfrSize_; }
+  uint32_t getMaxTfrSize() { return nvmeData_.getMaxTfrSize(); }
 
   // Get the NVMe specific info on this device.
   NvmeData& getNvmeData() { return nvmeData_; }
+
+  // Reads FDP status descriptor into Buffer
+  Buffer nvmeFdpStatus(int fd);
 
   // Prepares the Uring_Cmd sqe for read command.
   void prepReadUringCmdSqe(struct io_uring_sqe& sqe, int fd, void* buf,
@@ -205,15 +243,18 @@ class FdpInfo {
   // Get FDP PlacementID for a NVMe NS specific PHNDL
   uint16_t getFdpPID(uint16_t fdpPHNDL) {
     // Fetch PID like placementIDs_[placementHandle].
-    // Use placementID = placementHandle in this version
-    return fdpPHNDL;
+    return placementIDs_[fdpPHNDL];
   }
 
   // Reads NvmeData for a NVMe device
   NvmeData readNvmeInfo(int fd);
 
   // Initialize the FDP device and populate necessary info.
-  void initializeFDP();
+  void initializeFDP(int fd);
+
+  // Generic NVMe IO mgmnt receive cmd
+  int nvmeIOMgmtRecv(int fd, uint32_t nsid, void *data, uint32_t data_len,
+      uint16_t mos, uint8_t mo);
 
   // 0u is considered as the default placement ID
   static constexpr uint16_t kDefaultPIDIdx = 0u;
@@ -224,7 +265,6 @@ class FdpInfo {
   uint16_t maxPIDIdx_{0};
   uint16_t nextPIDIdx_{0};
   NvmeData nvmeData_{};
-  uint32_t maxTfrSize_{};
 };
 } // namespace navy
 } // namespace cachelib
