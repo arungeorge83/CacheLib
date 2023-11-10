@@ -15,7 +15,7 @@
  */
 
 #include "cachelib/navy/common/Device.h"
-#include "cachelib/navy/common/FDPDevice.h"
+#include "cachelib/navy/common/FdpNvme.h"
 
 #include <folly/File.h>
 #include <folly/Format.h>
@@ -227,7 +227,7 @@ class AsyncIoContext : public IoContext {
                  folly::EventBase* evb,
                  size_t capacity,
                  bool useIoUring,
-                 std::shared_ptr<FdpInfo> fdpInfo);
+                 std::shared_ptr<FdpNvme> fdpNvme);
 
   ~AsyncIoContext() override = default;
 
@@ -280,7 +280,7 @@ class AsyncIoContext : public IoContext {
   size_t numCompleted_ = 0;
 
   // Device info for FDP support
-  std::shared_ptr<FdpInfo> fdpInfo_;
+  std::shared_ptr<FdpNvme> fdpNvme_;
 };
 
 // An FileDevice manages direct I/O to either a single or multiple (RAID0)
@@ -339,7 +339,7 @@ class FileDevice : public Device {
   // Whether FDP Placement mode is enabled or not
   bool isFDPEnabled_{false};
   // Device info for FDP support
-  std::shared_ptr<FdpInfo> fdpInfo_{nullptr};
+  std::shared_ptr<FdpNvme> fdpNvme_{nullptr};
 
   AtomicCounter numProcessed_{0};
 
@@ -774,12 +774,12 @@ AsyncIoContext::AsyncIoContext(std::unique_ptr<folly::AsyncBase>&& asyncBase,
                                folly::EventBase* evb,
                                size_t capacity,
                                bool useIoUring,
-                               std::shared_ptr<FdpInfo> fdpInfo)
+                               std::shared_ptr<FdpNvme> fdpNvme)
     : asyncBase_(std::move(asyncBase)),
       id_(id),
       qDepth_(capacity),
       useIoUring_(useIoUring),
-      fdpInfo_(fdpInfo) {
+      fdpNvme_(fdpNvme) {
 #ifdef CACHELIB_IOURING_DISABLE
   // io_uring is not available on the system
   XDCHECK(!useIoUring_);
@@ -801,7 +801,7 @@ AsyncIoContext::AsyncIoContext(std::unique_ptr<folly::AsyncBase>&& asyncBase,
         "[{}] Created new async io context with qdepth {}{} io_engine {} {}",
         getName(), qDepth_, qDepth_ == 1 ? " (sync wait)" : "",
         useIoUring_ ? "io_uring" : "libaio",
-        (fdpInfo_ != nullptr) ? "FDP enabled" : "");
+        (fdpNvme_ != nullptr) ? "FDP enabled" : "");
 }
 
 void AsyncIoContext::pollCompletion() {
@@ -839,7 +839,7 @@ void AsyncIoContext::handleCompletion(
                          aop->result(), iop->toString());
     }
 
-    iop->done(aop->result(), fdpInfo_ != nullptr);
+    iop->done(aop->result(), fdpNvme_ != nullptr);
 
     if (!waitList_.empty()) {
       auto& waiter = waitList_.front();
@@ -888,9 +888,9 @@ AsyncIoContext::prepUringCmdAsyncIo(int fd, uint8_t opType, void* data,
   iouringCmdOp->initBase();
   struct io_uring_sqe& sqe = iouringCmdOp->getSqe();
   if (opType == OpType::READ) {
-    fdpInfo_->prepReadUringCmdSqe(sqe, fd, data, size, offset);
+    fdpNvme_->prepReadUringCmdSqe(sqe, fd, data, size, offset);
   } else {
-    fdpInfo_->prepWriteUringCmdSqe(sqe, fd, data, size, offset, handle);
+    fdpNvme_->prepWriteUringCmdSqe(sqe, fd, data, size, offset, handle);
   }
   asyncOp = std::move(iouringCmdOp);
   asyncOp->setUserData(userdata);
@@ -913,7 +913,7 @@ bool AsyncIoContext::submitIo(IOOp& op) {
   }
 
   std::unique_ptr<folly::AsyncBaseOp> asyncOp;
-  if (fdpInfo_ != nullptr) {
+  if (fdpNvme_ != nullptr) {
     asyncOp = prepUringCmdAsyncIo(op.fd_, req.opType_, op.data_,
         op.size_, op.offset_, &op, op.handle_);
   } else {
@@ -982,8 +982,8 @@ FileDevice::FileDevice(std::vector<folly::File>&& fvec,
   }
 #ifndef CACHELIB_IOURING_DISABLE
   if (isFDPEnabled_) {
-    fdpInfo_ = std::make_shared<FdpInfo>(fvec_[0].fd());
-    setMaxIOSize(fdpInfo_->getMaxTfrSize());
+    fdpNvme_ = std::make_shared<FdpNvme>(fvec_[0].fd());
+    setMaxIOSize(fdpNvme_->getMaxTfrSize());
   }
 #else
   isFDPEnabled_ = false;
@@ -1059,7 +1059,7 @@ IoContext* FileDevice::getIoContext() {
 
     auto idx = incrementalIdx_++;
     tlContext_.reset(new AsyncIoContext(std::move(asyncBase), idx, evb,
-                          qDepthPerContext_, useIoUring, fdpInfo_));
+                          qDepthPerContext_, useIoUring, fdpNvme_));
 
     {
       // Keep pointers in a vector to ease the gdb debugging
@@ -1076,7 +1076,7 @@ IoContext* FileDevice::getIoContext() {
 
 int FileDevice::allocatePlacementHandle() {
   if (isFDPEnabled_) {
-    return fdpInfo_->allocateFdpHandle();
+    return fdpNvme_->allocateFdpHandle();
   }
   return -1;
 }

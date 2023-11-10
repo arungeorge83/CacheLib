@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "cachelib/navy/common/FDPDevice.h"
+#include "cachelib/navy/common/FdpNvme.h"
 
 #include <linux/nvme_ioctl.h>
 #include <sys/ioctl.h>
@@ -26,13 +26,13 @@ namespace facebook {
 namespace cachelib {
 namespace navy {
 
-FdpInfo::FdpInfo(int fd) {
+FdpNvme::FdpNvme(int fd) {
   nvmeData_ = readNvmeInfo(fd);
   initializeFDP(fd);
   XLOG(INFO)<< "Creating FdpDevice on fd :" << fd;
 }
 
-int FdpInfo::allocateFdpHandle() {
+int FdpNvme::allocateFdpHandle() {
   uint16_t phndl;
 
   // Get NS specific Fdp Placement Handle(PHNDL)
@@ -47,7 +47,7 @@ int FdpInfo::allocateFdpHandle() {
   return static_cast<int>(pid);
 }
 
-void FdpInfo::initializeFDP(int fd) {
+void FdpNvme::initializeFDP(int fd) {
   nextPIDIdx_ = kDefaultPIDIdx + 1;
 
   Buffer buffer = nvmeFdpStatus(fd);
@@ -67,7 +67,7 @@ void FdpInfo::initializeFDP(int fd) {
             <<" Last PID: "<<placementIDs_[maxPIDIdx_];
 }
 
-int FdpInfo::nvmeIOMgmtRecv(int fd, uint32_t nsid, void *data,
+int FdpNvme::nvmeIOMgmtRecv(int fd, uint32_t nsid, void *data,
                   uint32_t data_len, uint16_t mos, uint8_t mo) {
   uint32_t cdw10 = (mo & 0xf) | (mos & 0xff << 16);
   uint32_t cdw11 = (data_len >> 2) - 1;
@@ -86,7 +86,7 @@ int FdpInfo::nvmeIOMgmtRecv(int fd, uint32_t nsid, void *data,
 }
 
 // struct nvme_fdp_ruh_status is a variable sized object; so using Buffer.
-Buffer FdpInfo::nvmeFdpStatus(int fd) {
+Buffer FdpNvme::nvmeFdpStatus(int fd) {
   struct nvme_fdp_ruh_status hdr;
   int err;
 
@@ -113,7 +113,7 @@ Buffer FdpInfo::nvmeFdpStatus(int fd) {
   return buffer;
 }
 
-void FdpInfo::prepFdpUringCmdSqe(struct io_uring_sqe& sqe, int fd, void* buf,
+void FdpNvme::prepFdpUringCmdSqe(struct io_uring_sqe& sqe, int fd, void* buf,
     size_t size, off_t start, uint8_t opcode, uint8_t dtype, uint16_t dspec,
     NvmeData& nvmeData) {
   uint32_t maxTfrSize = getMaxTfrSize();
@@ -149,13 +149,13 @@ void FdpInfo::prepFdpUringCmdSqe(struct io_uring_sqe& sqe, int fd, void* buf,
   cmd->nsid = nvmeData.nsId();
 }
 
-void FdpInfo::prepReadUringCmdSqe(struct io_uring_sqe& sqe, int fd, void* buf,
+void FdpNvme::prepReadUringCmdSqe(struct io_uring_sqe& sqe, int fd, void* buf,
     size_t size, off_t start) {
   // Placement Handle is not used for read.
   prepFdpUringCmdSqe(sqe, fd, buf, size, start, nvme_cmd_read, 0, 0, getNvmeData());
 }
 
-void FdpInfo::prepWriteUringCmdSqe(struct io_uring_sqe& sqe, int fd, void* buf,
+void FdpNvme::prepWriteUringCmdSqe(struct io_uring_sqe& sqe, int fd, void* buf,
     size_t size, off_t start, int handle) {
   static constexpr uint8_t kPlacementMode = 2;
   uint16_t id;
@@ -172,7 +172,7 @@ void FdpInfo::prepWriteUringCmdSqe(struct io_uring_sqe& sqe, int fd, void* buf,
               kPlacementMode, id, getNvmeData());
 }
 
-NvmeData FdpInfo::readNvmeInfo(int fd) {
+NvmeData FdpNvme::readNvmeInfo(int fd) {
   int namespace_id = ioctl(fd, NVME_IOCTL_ID);
   if (namespace_id < 0) {
     XLOG(ERR)<< "failed to fetch namespace-id, fd "<< fd;

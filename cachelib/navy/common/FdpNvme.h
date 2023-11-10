@@ -206,12 +206,12 @@ class NvmeData {
 // This embeds the FDP semantics and specific io-handling.
 // Note: IO with FDP semantics need to be sent through Io_Uring_cmd interface
 // as of now; and not supported through conventional block interfaces.
-class FdpInfo {
+class FdpNvme {
  public:
-  FdpInfo(int fd);
+  FdpNvme(int fd);
 
-  FdpInfo(const FdpInfo&) = delete;
-  FdpInfo& operator=(const FdpInfo&) = delete;
+  FdpNvme(const FdpNvme&) = delete;
+  FdpNvme& operator=(const FdpNvme&) = delete;
 
   // Allocates an FDP specific placement handle. This handle will be
   // interpreted by the device for data placement.
